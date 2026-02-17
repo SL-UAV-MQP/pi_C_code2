@@ -26,19 +26,22 @@ int wpi_test_config_init(wpi_test_config_t* config, const char* log_base_path) {
     /* Define test zones */
     config->num_zones = 3;
 
-    strcpy(config->zones[0].name, "WPI Quad (Central)");
+    strncpy(config->zones[0].name, "WPI Quad (Central)", sizeof(config->zones[0].name) - 1);
+    config->zones[0].name[sizeof(config->zones[0].name) - 1] = '\0';
     config->zones[0].lat = WPI_QUAD_LAT;
     config->zones[0].lon = WPI_QUAD_LON;
     config->zones[0].recommended_alt_m = 15.0;
     config->zones[0].clear_radius_m = 30.0;
 
-    strcpy(config->zones[1].name, "Park Ave Fields");
+    strncpy(config->zones[1].name, "Park Ave Fields", sizeof(config->zones[1].name) - 1);
+    config->zones[1].name[sizeof(config->zones[1].name) - 1] = '\0';
     config->zones[1].lat = WPI_PARK_AVE_LAT;
     config->zones[1].lon = WPI_PARK_AVE_LON;
     config->zones[1].recommended_alt_m = 25.0;
     config->zones[1].clear_radius_m = 80.0;
 
-    strcpy(config->zones[2].name, "Parking Lot D");
+    strncpy(config->zones[2].name, "Parking Lot D", sizeof(config->zones[2].name) - 1);
+    config->zones[2].name[sizeof(config->zones[2].name) - 1] = '\0';
     config->zones[2].lat = WPI_PARKING_D_LAT;
     config->zones[2].lon = WPI_PARKING_D_LON;
     config->zones[2].recommended_alt_m = 20.0;
@@ -108,6 +111,9 @@ void wpi_test_config_free(wpi_test_config_t* config) {
         diag_print_summary(&config->logger);
         diag_logger_close(&config->logger);
     }
+
+    /* WC-4 fix: zero out struct to prevent stale data access */
+    memset(config, 0, sizeof(*config));
 }
 
 /* ============================================================================
@@ -189,10 +195,17 @@ int wpi_campus_self_test(wpi_test_config_t* config) {
             }
         }
         if (bands_valid && config->num_bands > 0) {
+            /* WC-2 fix: count band types dynamically */
+            int lte_count = 0, p25_count = 0;
+            for (int i = 0; i < config->num_bands; i++) {
+                if (strncmp(config->bands[i].signal_type, "P25", 3) == 0) {
+                    p25_count++;
+                } else {
+                    lte_count++;
+                }
+            }
             printf("PASS (%d bands: %d LTE, %d P25)\n",
-                   config->num_bands,
-                   config->num_bands - 2,  /* LTE bands */
-                   2);                      /* P25 bands */
+                   config->num_bands, lte_count, p25_count);
             pass_count++;
         } else {
             printf("FAIL\n");
