@@ -92,17 +92,21 @@ typedef struct {
     double expected_snr_max;
 } test_band_t;
 
+/** Maximum test zones and bands */
+#define WPI_MAX_ZONES 4
+#define WPI_MAX_BANDS 10
+
 /** WPI test configuration */
 typedef struct {
     /* Site database */
     cell_tower_database_t tower_db;
 
     /* Test zones */
-    test_zone_t zones[4];
+    test_zone_t zones[WPI_MAX_ZONES];
     int num_zones;
 
     /* Test frequency bands */
-    test_band_t bands[10];
+    test_band_t bands[WPI_MAX_BANDS];
     int num_bands;
 
     /* Logger */
