@@ -59,8 +59,10 @@ static void compute_uca_steering_vector(
     }
     norm = sqrt(norm);
 
-    for (int m = 0; m < num_elements; m++) {
-        steering_vector[m] /= norm;
+    if (norm > 1e-15) {
+        for (int m = 0; m < num_elements; m++) {
+            steering_vector[m] /= norm;
+        }
     }
 }
 
@@ -892,6 +894,14 @@ music_status_t beamforming_process_signals(
         status = adaptive_apply_beamformer(signals, num_elements, num_snapshots,
                                            result->weights, result->output);
         free(R);
+    } else if (method == BF_METHOD_MPDR) {
+        /* BUG-18 fix: MPDR without interference data - fall back to MVDR */
+        status = adaptive_steer_beam(&processor->adaptive, signals,
+                                     num_elements, num_snapshots,
+                                     desired_azimuth, 0.0, result);
+    } else {
+        /* Unknown method */
+        return MUSIC_ERROR_INVALID_CONFIG;
     }
 
     result->num_samples = num_snapshots;
@@ -985,6 +995,10 @@ beamforming_result_t* beamforming_result_alloc(int num_elements, int num_samples
         beamforming_result_free(result);
         return NULL;
     }
+
+    /* BUG-20 fix: initialize method and sinr to avoid uninitialized reads */
+    result->method[0] = '\0';
+    result->sinr_db = 0.0;
 
     return result;
 }
