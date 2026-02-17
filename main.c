@@ -93,6 +93,18 @@ typedef struct {
     bool debug;
 } cli_options_t;
 
+/** Pre-allocated pipeline buffers (MA-2/MA-6 fix: avoid per-frame malloc) */
+typedef struct {
+    signal_matrix_t* signals;
+    cdouble_t* filtered;      /* PIPELINE_NUM_SNAPSHOTS */
+    cdouble_t* ch_data;       /* PIPELINE_NUM_SNAPSHOTS, reused per channel */
+    cdouble_t* nr_output;     /* PIPELINE_NUM_SNAPSHOTS */
+    cdouble_t* ch0_data;      /* PIPELINE_NUM_SNAPSHOTS, for protocol detection */
+    filter_coeffs_t bp_filter;
+    bool filter_valid;
+    bool allocated;
+} pipeline_buffers_t;
+
 /** Pipeline runtime context */
 typedef struct {
     /* Configuration */
@@ -103,7 +115,11 @@ typedef struct {
 
     /* Site configuration */
     wpi_test_config_t wpi_config;
-    cell_tower_database_t tower_db;
+    cell_tower_database_t cmrcm_tower_db;   /* owned DB for CMRCM site */
+    cell_tower_database_t* tower_db;        /* MA-1 fix: pointer to active DB */
+
+    /* Pre-allocated buffers */
+    pipeline_buffers_t buffers;
 
     /* Signal processing */
     signal_processor_t* sig_proc;
@@ -155,7 +171,7 @@ static void signal_handler(int sig) {
     if (g_ctx) {
         g_ctx->running = false;
     }
-    printf("\n[MAIN] Ctrl+C received, shutting down...\n");
+    /* MA-4 fix: printf is not async-signal-safe, message printed after main loop */
 }
 
 /* ============================================================================
@@ -275,7 +291,7 @@ static int pipeline_init(pipeline_context_t* ctx) {
             fprintf(stderr, "[INIT] Failed to initialize WPI config\n");
             return -1;
         }
-        ctx->tower_db = ctx->wpi_config.tower_db;
+        ctx->tower_db = &ctx->wpi_config.tower_db;  /* MA-1 fix: pointer, not copy */
         ctx->logger = &ctx->wpi_config.logger;
         ctx->logger_ready = ctx->wpi_config.logger_initialized;
 
@@ -291,15 +307,16 @@ static int pipeline_init(pipeline_context_t* ctx) {
 
         /* Set ENU origin to WPI campus center */
         enu_set_origin(&ctx->enu_origin,
-                       ctx->tower_db.ref_lat,
-                       ctx->tower_db.ref_lon,
+                       ctx->tower_db->ref_lat,
+                       ctx->tower_db->ref_lon,
                        150.0);  /* ~150m ASL */
     } else {
         printf("[INIT] Site: CMRCM Field\n");
-        if (cell_tower_db_init_site(&ctx->tower_db, SITE_CMRCM) != 0) {
+        if (cell_tower_db_init_site(&ctx->cmrcm_tower_db, SITE_CMRCM) != 0) {
             fprintf(stderr, "[INIT] Failed to initialize CMRCM tower DB\n");
             return -1;
         }
+        ctx->tower_db = &ctx->cmrcm_tower_db;  /* MA-1 fix: pointer */
 
         /* Initialize logger directly */
         if (diag_logger_init(&ctx->cmrcm_logger, ctx->opts.log_path, DIAG_LEVEL_INFO) == 0) {
@@ -312,8 +329,8 @@ static int pipeline_init(pipeline_context_t* ctx) {
         }
 
         enu_set_origin(&ctx->enu_origin,
-                       ctx->tower_db.ref_lat,
-                       ctx->tower_db.ref_lon,
+                       ctx->tower_db->ref_lat,
+                       ctx->tower_db->ref_lon,
                        0.0);
     }
 
@@ -412,6 +429,32 @@ static int pipeline_init(pipeline_context_t* ctx) {
     printf("[INIT] SDR: Disabled (compile with USE_SDR=1 for hardware)\n");
 #endif
 
+    /* MA-2/MA-6 fix: pre-allocate pipeline buffers */
+    ctx->buffers.signals = signal_matrix_alloc(MAX_ANTENNAS, PIPELINE_NUM_SNAPSHOTS);
+    ctx->buffers.filtered = (cdouble_t*)malloc(PIPELINE_NUM_SNAPSHOTS * sizeof(cdouble_t));
+    ctx->buffers.ch_data = (cdouble_t*)malloc(PIPELINE_NUM_SNAPSHOTS * sizeof(cdouble_t));
+    ctx->buffers.nr_output = (cdouble_t*)malloc(PIPELINE_NUM_SNAPSHOTS * sizeof(cdouble_t));
+    ctx->buffers.ch0_data = (cdouble_t*)malloc(PIPELINE_NUM_SNAPSHOTS * sizeof(cdouble_t));
+    if (!ctx->buffers.signals || !ctx->buffers.filtered || !ctx->buffers.ch_data ||
+        !ctx->buffers.nr_output || !ctx->buffers.ch0_data) {
+        fprintf(stderr, "[INIT] Failed to pre-allocate pipeline buffers\n");
+        return -1;
+    }
+    ctx->buffers.allocated = true;
+
+    /* MA-6 fix: design bandpass filter once (constant parameters) */
+    double bw_half = 5e6;
+    double low_cut = 1e6;
+    double high_cut = bw_half;
+    if (signal_processor_design_bandpass(
+            (double)PIPELINE_SAMPLE_RATE,
+            low_cut, high_cut, 4, &ctx->buffers.bp_filter) == MUSIC_SUCCESS) {
+        ctx->buffers.filter_valid = true;
+    } else {
+        fprintf(stderr, "[INIT] WARNING: Bandpass filter design failed\n");
+        ctx->buffers.filter_valid = false;
+    }
+
     /* Bearing accumulator */
     ctx->num_bearings = 0;
 
@@ -451,6 +494,16 @@ static void pipeline_cleanup(pipeline_context_t* ctx) {
     /* Print diagnostic summary */
     if (ctx->logger_ready) {
         diag_print_summary(ctx->logger);
+    }
+
+    /* Free pre-allocated buffers */
+    if (ctx->buffers.allocated) {
+        if (ctx->buffers.signals) signal_matrix_free(ctx->buffers.signals);
+        free(ctx->buffers.filtered);
+        free(ctx->buffers.ch_data);
+        free(ctx->buffers.nr_output);
+        free(ctx->buffers.ch0_data);
+        ctx->buffers.allocated = false;
     }
 
     /* Free resources */
@@ -506,11 +559,8 @@ static int pipeline_process_frame(pipeline_context_t* ctx) {
     /* ---- Stage 1: SDR Capture ---- */
     t_stage = get_time_s();
 
-    signal_matrix_t* signals = signal_matrix_alloc(MAX_ANTENNAS, PIPELINE_NUM_SNAPSHOTS);
-    if (!signals) {
-        fprintf(stderr, "[PIPE] Memory allocation failed\n");
-        return -1;
-    }
+    /* Use pre-allocated signal matrix (MA-2 fix) */
+    signal_matrix_t* signals = ctx->buffers.signals;
 
 #ifdef USE_SDR
     /* Synchronize and capture from 3x PLUTOs */
@@ -519,7 +569,6 @@ static int pipeline_process_frame(pipeline_context_t* ctx) {
     sdr_capture_result_t* capture = sdr_capture_result_alloc(
         PIPELINE_NUM_SNAPSHOTS, NUM_RX_CHANNELS);
     if (!capture) {
-        signal_matrix_free(signals);
         return -1;
     }
 
@@ -529,7 +578,6 @@ static int pipeline_process_frame(pipeline_context_t* ctx) {
         fprintf(stderr, "[PIPE] SDR capture failed: %s\n",
                 sdr_pluto_get_error_string(cap_ret));
         sdr_capture_result_free(capture);
-        signal_matrix_free(signals);
         return -1;
     }
 
@@ -544,8 +592,8 @@ static int pipeline_process_frame(pipeline_context_t* ctx) {
 
     /* Simulate signal from first tower's azimuth */
     double test_azimuth_deg = 45.0;  /* default */
-    if (ctx->tower_db.num_towers > 0) {
-        test_azimuth_deg = ctx->tower_db.towers[0].azimuth_from_ref;
+    if (ctx->tower_db->num_towers > 0) {
+        test_azimuth_deg = ctx->tower_db->towers[0].azimuth_from_ref;
     }
     /* Generate steering vector for test signal */
     cdouble_t steer[MAX_ANTENNAS];
@@ -571,38 +619,21 @@ static int pipeline_process_frame(pipeline_context_t* ctx) {
     /* ---- Stage 2: Signal Processing (per channel) ---- */
     t_stage = get_time_s();
 
-    /* Design bandpass filter around center frequency */
-    double bw_half = 5e6;  /* ±5 MHz around center */
-    double low_cut = 1e6;  /* Relative to baseband */
-    double high_cut = bw_half;
-    filter_coeffs_t bp_filter;
-
-    if (signal_processor_design_bandpass(
-            (double)PIPELINE_SAMPLE_RATE,
-            low_cut, high_cut, 4, &bp_filter) == MUSIC_SUCCESS) {
-        /* Apply filter to each channel */
-        cdouble_t* filtered = (cdouble_t*)malloc(
-            PIPELINE_NUM_SNAPSHOTS * sizeof(cdouble_t));
-        if (filtered) {
-            for (int ch = 0; ch < MAX_ANTENNAS; ch++) {
-                /* Extract channel data */
-                cdouble_t* ch_data = (cdouble_t*)malloc(
-                    PIPELINE_NUM_SNAPSHOTS * sizeof(cdouble_t));
-                if (!ch_data) continue;
-
-                for (int n = 0; n < PIPELINE_NUM_SNAPSHOTS; n++) {
-                    ch_data[n] = signals->data[n * MAX_ANTENNAS + ch];
-                }
-
-                if (signal_processor_apply_filter(&bp_filter, ch_data,
-                        PIPELINE_NUM_SNAPSHOTS, filtered) == MUSIC_SUCCESS) {
-                    for (int n = 0; n < PIPELINE_NUM_SNAPSHOTS; n++) {
-                        signals->data[n * MAX_ANTENNAS + ch] = filtered[n];
-                    }
-                }
-                free(ch_data);
+    /* MA-6 fix: use pre-designed filter; MA-2 fix: use pre-allocated buffers */
+    if (ctx->buffers.filter_valid) {
+        for (int ch = 0; ch < MAX_ANTENNAS; ch++) {
+            /* Extract channel data into pre-allocated buffer */
+            for (int n = 0; n < PIPELINE_NUM_SNAPSHOTS; n++) {
+                ctx->buffers.ch_data[n] = signals->data[n * MAX_ANTENNAS + ch];
             }
-            free(filtered);
+
+            if (signal_processor_apply_filter(&ctx->buffers.bp_filter,
+                    ctx->buffers.ch_data, PIPELINE_NUM_SNAPSHOTS,
+                    ctx->buffers.filtered) == MUSIC_SUCCESS) {
+                for (int n = 0; n < PIPELINE_NUM_SNAPSHOTS; n++) {
+                    signals->data[n * MAX_ANTENNAS + ch] = ctx->buffers.filtered[n];
+                }
+            }
         }
     }
 
@@ -611,32 +642,22 @@ static int pipeline_process_frame(pipeline_context_t* ctx) {
     /* ---- Stage 3: Noise Reduction ---- */
     t_stage = get_time_s();
 
-    /* Apply spectral subtraction per channel */
-    cdouble_t* nr_output = (cdouble_t*)malloc(
-        PIPELINE_NUM_SNAPSHOTS * sizeof(cdouble_t));
+    /* Apply spectral subtraction per channel (MA-2 fix: pre-allocated buffers) */
     noise_reduction_metrics_t nr_metrics;
 
-    if (nr_output) {
-        for (int ch = 0; ch < MAX_ANTENNAS; ch++) {
-            cdouble_t* ch_data = (cdouble_t*)malloc(
-                PIPELINE_NUM_SNAPSHOTS * sizeof(cdouble_t));
-            if (!ch_data) continue;
-
-            for (int n = 0; n < PIPELINE_NUM_SNAPSHOTS; n++) {
-                ch_data[n] = signals->data[n * MAX_ANTENNAS + ch];
-            }
-
-            if (noise_reducer_process_single(&ctx->noise_reducer,
-                    ch_data, PIPELINE_NUM_SNAPSHOTS,
-                    NR_SPECTRAL_SUBTRACTION,
-                    nr_output, &nr_metrics) == MUSIC_SUCCESS) {
-                for (int n = 0; n < PIPELINE_NUM_SNAPSHOTS; n++) {
-                    signals->data[n * MAX_ANTENNAS + ch] = nr_output[n];
-                }
-            }
-            free(ch_data);
+    for (int ch = 0; ch < MAX_ANTENNAS; ch++) {
+        for (int n = 0; n < PIPELINE_NUM_SNAPSHOTS; n++) {
+            ctx->buffers.ch_data[n] = signals->data[n * MAX_ANTENNAS + ch];
         }
-        free(nr_output);
+
+        if (noise_reducer_process_single(&ctx->noise_reducer,
+                ctx->buffers.ch_data, PIPELINE_NUM_SNAPSHOTS,
+                NR_SPECTRAL_SUBTRACTION,
+                ctx->buffers.nr_output, &nr_metrics) == MUSIC_SUCCESS) {
+            for (int n = 0; n < PIPELINE_NUM_SNAPSHOTS; n++) {
+                signals->data[n * MAX_ANTENNAS + ch] = ctx->buffers.nr_output[n];
+            }
+        }
     }
 
     timing.noise_reduce_ms = (get_time_s() - t_stage) * 1000.0;
@@ -667,39 +688,33 @@ static int pipeline_process_frame(pipeline_context_t* ctx) {
     /* ---- Stage 5: Protocol Detection ---- */
     t_stage = get_time_s();
 
-    /* Use channel 0 for protocol detection */
-    cdouble_t* ch0_data = (cdouble_t*)malloc(
-        PIPELINE_NUM_SNAPSHOTS * sizeof(cdouble_t));
+    /* Use channel 0 for protocol detection (MA-2 fix: pre-allocated buffer) */
     int detected_cell_id = -1;
     char detected_type[16] = "UNKNOWN";
 
-    if (ch0_data) {
-        for (int n = 0; n < PIPELINE_NUM_SNAPSHOTS; n++) {
-            ch0_data[n] = signals->data[n * MAX_ANTENNAS + 0];
-        }
+    for (int n = 0; n < PIPELINE_NUM_SNAPSHOTS; n++) {
+        ctx->buffers.ch0_data[n] = signals->data[n * MAX_ANTENNAS + 0];
+    }
 
-        /* Try LTE detection first */
-        lte_cell_detection_t lte_cells[LTE_MAX_DETECTIONS];
-        int n_lte = lte_detect_signal(&ctx->lte_det, ch0_data,
+    /* Try LTE detection first */
+    lte_cell_detection_t lte_cells[LTE_MAX_DETECTIONS];
+    int n_lte = lte_detect_signal(&ctx->lte_det, ctx->buffers.ch0_data,
+                                   PIPELINE_NUM_SNAPSHOTS,
+                                   lte_cells, LTE_MAX_DETECTIONS);
+    if (n_lte > 0) {
+        detected_cell_id = lte_cells[0].cell_id;
+        strncpy(detected_type, "LTE", sizeof(detected_type) - 1);
+    }
+
+    /* Try P25 detection */
+    if (n_lte == 0) {
+        p25_detection_t p25_dets[P25_MAX_DETECTIONS];
+        int n_p25 = p25_detect_signal(&ctx->p25_det, ctx->buffers.ch0_data,
                                        PIPELINE_NUM_SNAPSHOTS,
-                                       lte_cells, LTE_MAX_DETECTIONS);
-        if (n_lte > 0) {
-            detected_cell_id = lte_cells[0].cell_id;
-            strncpy(detected_type, "LTE", sizeof(detected_type) - 1);
+                                       p25_dets, P25_MAX_DETECTIONS);
+        if (n_p25 > 0) {
+            strncpy(detected_type, "P25", sizeof(detected_type) - 1);
         }
-
-        /* Try P25 detection */
-        if (n_lte == 0) {
-            p25_detection_t p25_dets[P25_MAX_DETECTIONS];
-            int n_p25 = p25_detect_signal(&ctx->p25_det, ch0_data,
-                                           PIPELINE_NUM_SNAPSHOTS,
-                                           p25_dets, P25_MAX_DETECTIONS);
-            if (n_p25 > 0) {
-                strncpy(detected_type, "P25", sizeof(detected_type) - 1);
-            }
-        }
-
-        free(ch0_data);
     }
 
     timing.protocol_ms = (get_time_s() - t_stage) * 1000.0;
@@ -722,10 +737,10 @@ static int pipeline_process_frame(pipeline_context_t* ctx) {
             const cell_tower_t* tower = NULL;
 
             if (detected_cell_id >= 0) {
-                tower = cell_tower_db_get_by_cell_id(&ctx->tower_db, detected_cell_id);
+                tower = cell_tower_db_get_by_cell_id(ctx->tower_db, detected_cell_id);
             }
             if (!tower) {
-                tower = cell_tower_db_get_by_azimuth(&ctx->tower_db,
+                tower = cell_tower_db_get_by_azimuth(ctx->tower_db,
                     detected.sources[s].azimuth_deg, 15.0);
             }
 
@@ -843,7 +858,7 @@ static int pipeline_process_frame(pipeline_context_t* ctx) {
 
                 /* Check against expected azimuth */
                 const cell_tower_t* closest = cell_tower_db_get_by_azimuth(
-                    &ctx->tower_db, detected.sources[s].azimuth_deg, 20.0);
+                    ctx->tower_db, detected.sources[s].azimuth_deg, 20.0);
                 if (closest) {
                     aoa_entry.expected_az = closest->azimuth_from_ref;
                     aoa_entry.az_error = detected.sources[s].azimuth_deg -
@@ -880,7 +895,7 @@ static int pipeline_process_frame(pipeline_context_t* ctx) {
             strncpy(sig_entry.signal_type, detected_type, sizeof(sig_entry.signal_type) - 1);
 
             const cell_tower_t* sig_tower = cell_tower_db_get_by_cell_id(
-                &ctx->tower_db, detected_cell_id);
+                ctx->tower_db, detected_cell_id);
             if (sig_tower) {
                 strncpy(sig_entry.tower_name, sig_tower->name,
                         sizeof(sig_entry.tower_name) - 1);
@@ -889,9 +904,8 @@ static int pipeline_process_frame(pipeline_context_t* ctx) {
         }
     }
 
-    /* Free MUSIC spectrum */
+    /* Free MUSIC spectrum (signals is pre-allocated, not freed here) */
     if (spectrum) music_spectrum_free(spectrum);
-    signal_matrix_free(signals);
 
     return 0;
 }
@@ -946,7 +960,7 @@ int main(int argc, char* argv[]) {
     printf("[MAIN] Press Ctrl+C to stop.\n\n");
 
     /* Print tower database for reference */
-    cell_tower_db_print_summary(&ctx.tower_db);
+    cell_tower_db_print_summary(ctx.tower_db);
     printf("\n");
 
     /* ---- Main Loop: LIVE State ---- */
@@ -977,7 +991,8 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    /* Shutdown */
+    /* Shutdown (print message deferred from signal handler for async-signal safety) */
+    printf("\n[MAIN] Shutting down...\n");
     pipeline_cleanup(&ctx);
 
     return 0;
