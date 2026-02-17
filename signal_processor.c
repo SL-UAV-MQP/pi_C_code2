@@ -28,6 +28,12 @@
  * @brief Create window function
  */
 static void create_window(window_type_t type, int size, double* window) {
+    /* BUG-04 fix: guard against size <= 1 to avoid division by zero */
+    if (size <= 1) {
+        if (size == 1) window[0] = 1.0;
+        return;
+    }
+
     switch (type) {
         case WINDOW_HAMMING:
             for (int n = 0; n < size; n++) {
@@ -582,39 +588,70 @@ music_status_t signal_processor_design_bandpass(
      * Their bilinear images are also conjugate pairs if the LP pole
      * is complex (which it is for N>1), or real pairs for N=1. */
 
-    /* Sort poles by imaginary part to pair conjugates properly */
-    /* For each LP pole (which is complex), it produces two BP poles.
-     * The conjugate of that LP pole produces two more BP poles.
-     * We need to pair each pole with its conjugate. */
+    /* BUG-01 fix: Pair poles into TRUE conjugate pairs.
+     * For bandpass, 2N digital poles must be grouped into N conjugate pairs
+     * (p, conj(p)) so that each biquad has REAL coefficients.
+     * Previous code paired poles [2k, 2k+1] from the same LP pole, but
+     * those are NOT conjugates for order > 1.
+     *
+     * Strategy: mark each pole as used, then for each unused pole find
+     * its conjugate among the remaining poles. */
+    bool used[8] = {false};  /* max 2N = 2*4 = 8 poles */
+    int pair_idx[4][2];
+    int npairs = 0;
 
-    /* Simple pairing: poles from same LP prototype pole are already adjacent
-     * in dz_poles[] (indices 2k and 2k+1), so pair them directly.
-     * This is robust for all orders including order 1 where poles may be real. */
-    int pair_idx[4][2]; /* pairs of pole indices */
-    int npairs = N;  /* N = filter order */
-    for (int k = 0; k < N; k++) {
-        pair_idx[k][0] = 2*k;
-        pair_idx[k][1] = 2*k + 1;
+    for (int i = 0; i < 2*N; i++) {
+        if (used[i]) continue;
+
+        /* Find conjugate partner: look for pole closest to conj(dz_poles[i]) */
+        cdouble_t target = conj(dz_poles[i]);
+        int best_j = -1;
+        double best_dist = 1e30;
+
+        for (int j = i + 1; j < 2*N; j++) {
+            if (used[j]) continue;
+            double dist = cabs(dz_poles[j] - target);
+            if (dist < best_dist) {
+                best_dist = dist;
+                best_j = j;
+            }
+        }
+
+        if (best_j >= 0 && best_dist < 1e-8) {
+            /* Found conjugate pair */
+            pair_idx[npairs][0] = i;
+            pair_idx[npairs][1] = best_j;
+            used[i] = true;
+            used[best_j] = true;
+            npairs++;
+        } else {
+            /* Real pole or no match found - pair with itself */
+            pair_idx[npairs][0] = i;
+            pair_idx[npairs][1] = i;
+            used[i] = true;
+            npairs++;
+        }
     }
 
     /* Each biquad section:
      * Numerator: one factor of (1 - z^-1)(1 + z^-1) = (1 - z^-2) = [1, 0, -1]
-     * Denominator: (1 - p*z^-1)(1 - p'*z^-1) where p, p' are conjugate
-     *            = [1, -(p+p'), p*p'] = [1, -2*Re(p), |p|^2]
+     * Denominator: (1 - p*z^-1)(1 - conj(p)*z^-1) where p, conj(p) are paired
+     *            = [1, -2*Re(p), |p|^2]
      */
     for (int s = 0; s < npairs; s++) {
         int i0 = pair_idx[s][0];
         int i1 = pair_idx[s][1];
 
-        /* Denominator */
+        /* Denominator from conjugate pair → guaranteed real coefficients */
         double a0 = 1.0;
         double a1, a2;
         if (i0 == i1) {
-            /* Real pole (doubled) - shouldn't happen for bandpass but safe */
+            /* Real pole (self-conjugate) */
             double p = creal(dz_poles[i0]);
             a1 = -2.0 * p;
             a2 = p * p;
         } else {
+            /* Conjugate pair: a1 = -(p + conj(p)) = -2*Re(p), a2 = |p|^2 */
             a1 = -2.0 * creal(dz_poles[i0]);
             a2 = creal(dz_poles[i0]) * creal(dz_poles[i0])
                + cimag(dz_poles[i0]) * cimag(dz_poles[i0]);
@@ -702,8 +739,8 @@ static void biquad_filter(const double* b, const double* a,
  * @param y Output signal
  * @param n Number of samples
  */
-static void apply_sos_filter(const filter_coeffs_t* coeffs,
-                              const double* x, double* y, int n) {
+static int apply_sos_filter(const filter_coeffs_t* coeffs,
+                             const double* x, double* y, int n) {
     int num_sections = coeffs->order;
 
     /* Copy input to output as starting point */
@@ -712,7 +749,7 @@ static void apply_sos_filter(const filter_coeffs_t* coeffs,
     /* Apply each biquad section in cascade */
     /* Use a temp buffer to avoid in-place issues */
     double* temp = (double*)malloc(n * sizeof(double));
-    if (!temp) return;
+    if (!temp) return -1;  /* BUG-03 fix: return error instead of silent fail */
 
     for (int s = 0; s < num_sections; s++) {
         double w1 = 0.0, w2 = 0.0;
@@ -722,6 +759,7 @@ static void apply_sos_filter(const filter_coeffs_t* coeffs,
     }
 
     free(temp);
+    return 0;
 }
 
 music_status_t signal_processor_apply_filter(
@@ -869,6 +907,7 @@ music_status_t signal_processor_detect_peaks(
     if (isnan(threshold)) {
         // Compute median as noise floor
         double* sorted = (double*)malloc(num_bins * sizeof(double));
+        if (!sorted) return MUSIC_ERROR_MEMORY;  /* BUG-08 fix */
         memcpy(sorted, spectrum, num_bins * sizeof(double));
 
         // Simple insertion sort for median
