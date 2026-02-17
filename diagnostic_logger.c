@@ -227,6 +227,7 @@ int diag_log_error(diag_logger_t* logger, diag_level_t level, const char* module
     if (!logger || !logger->error_file || !module || !msg) {
         return -1;
     }
+    if (!logger->enabled) return 0;  /* DL-2 fix: consistent with other log functions */
 
     if (level > logger->level) return 0;
 
