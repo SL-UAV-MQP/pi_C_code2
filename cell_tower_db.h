@@ -41,7 +41,8 @@
 /** Test site identifiers */
 typedef enum {
     SITE_CMRCM = 0,    /**< CMRCM Field (deployment target) */
-    SITE_WPI_CAMPUS     /**< WPI Campus (testing/debugging) */
+    SITE_WPI_CAMPUS,    /**< WPI Campus (testing/debugging) */
+    SITE_CUSTOM         /**< Custom site (user-defined) */
 } test_site_t;
 
 /* ============================================================================
