@@ -298,7 +298,7 @@ int cell_tower_db_init_custom(cell_tower_database_t* db,
     }
 
     db->num_towers = 0;
-    db->active_site = SITE_CMRCM;  /* default enum, custom coords override */
+    db->active_site = SITE_CUSTOM;  /* CT-1 fix: custom site, not CMRCM */
     strncpy(db->site_name, site_name, MAX_SITE_NAME_LENGTH - 1);
     db->site_name[MAX_SITE_NAME_LENGTH - 1] = '\0';
     db->ref_lat = ref_lat;
@@ -483,6 +483,11 @@ void cell_tower_db_print_summary(const cell_tower_database_t* db) {
 
     printf("\n=== %s Cell Tower Database ===\n", db->site_name);
     printf("Reference: %.6f, %.6f\n\n", db->ref_lat, db->ref_lon);
+
+    if (db->num_towers == 0) {
+        printf("  (no towers)\n");
+        return;
+    }
 
     int* indices = (int*)malloc(db->num_towers * sizeof(int));
     if (!indices) return;
