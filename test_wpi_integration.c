@@ -232,6 +232,29 @@ static void test_lcmv_beamforming(void) {
     }
     TEST_ASSERT(weight_norm > 1e-10, "LCMV weights are non-zero");
 
+    /* TW-1 fix: verify LCMV null-steering property */
+    /* Compute beam response at desired direction (45 deg) */
+    cdouble_t response_desired = 0.0;
+    cdouble_t response_interf = 0.0;
+    for (int m = 0; m < M; m++) {
+        double phi_m = 2.0 * M_PI * m / M;
+        double x_m = config.radius * cos(phi_m);
+        double y_m = config.radius * sin(phi_m);
+
+        /* Steering vector at desired direction (45 deg) */
+        double phase_d = k * (x_m * cos(45.0 * M_PI / 180.0) +
+                              y_m * sin(45.0 * M_PI / 180.0));
+        response_desired += conj(weights[m]) * cexp(I * phase_d);
+
+        /* Steering vector at interference direction (180 deg) */
+        double phase_i = k * (x_m * cos(180.0 * M_PI / 180.0) +
+                              y_m * sin(180.0 * M_PI / 180.0));
+        response_interf += conj(weights[m]) * cexp(I * phase_i);
+    }
+    TEST_ASSERT(cabs(response_desired) > 0.3, "LCMV: desired direction gain > 0.3");
+    TEST_ASSERT(cabs(response_interf) < cabs(response_desired),
+                "LCMV: interference response < desired response");
+
     adaptive_beamformer_free(&bf);
     free(signals);
     free(R);
@@ -269,6 +292,30 @@ static void test_lcmv_spatial(void) {
         }
     }
     TEST_ASSERT(non_uniform, "LCMV weights are non-uniform (not placeholder)");
+
+    /* TW-1 fix: verify spatial null-steering property */
+    double freq_hz = 1050e6;
+    double wl = 299792458.0 / freq_hz;
+    double kr = 2.0 * M_PI / wl;
+    double sp_radius = 0.6 * wl;  /* matches NR_UCA_RADIUS default */
+
+    cdouble_t resp_desired = 0.0;
+    cdouble_t resp_interf = 0.0;
+    for (int m = 0; m < 6; m++) {
+        double phi_m = 2.0 * M_PI * m / 6.0;
+        double x_m = sp_radius * cos(phi_m);
+        double y_m = sp_radius * sin(phi_m);
+
+        double phase_d = kr * (x_m * cos(90.0 * M_PI / 180.0) +
+                               y_m * sin(90.0 * M_PI / 180.0));
+        resp_desired += conj(weights[m]) * cexp(I * phase_d);
+
+        double phase_i = kr * (x_m * cos(270.0 * M_PI / 180.0) +
+                               y_m * sin(270.0 * M_PI / 180.0));
+        resp_interf += conj(weights[m]) * cexp(I * phase_i);
+    }
+    TEST_ASSERT(cabs(resp_interf) < cabs(resp_desired),
+                "Spatial LCMV: null direction response < desired response");
 
     spatial_canceller_free(&canceller);
 }
@@ -404,7 +451,40 @@ static void test_wpi_config(void) {
  * Main
  * ============================================================================ */
 
+/* ============================================================================
+ * Test 7: Logger Error Handling (TW-3)
+ * ============================================================================ */
+
+static void test_logger_error_handling(void) {
+    printf("\n--- Test: Logger Error Handling ---\n");
+
+    /* Test NULL logger */
+    int ret = diag_log_signal(NULL, NULL);
+    TEST_ASSERT(ret != 0, "NULL logger returns error");
+
+    /* Test init with invalid path */
+    diag_logger_t bad_logger;
+    ret = diag_logger_init(&bad_logger, "/nonexistent/deeply/nested/path/log",
+                           DIAG_LEVEL_DEBUG);
+    /* May succeed or fail depending on OS - just verify no crash */
+    if (ret == 0) {
+        diag_logger_close(&bad_logger);
+    }
+    TEST_ASSERT(1, "Invalid path init does not crash");
+
+    /* Test logging to closed logger */
+    diag_logger_t closed_logger;
+    memset(&closed_logger, 0, sizeof(closed_logger));
+    closed_logger.enabled = false;
+    diag_signal_entry_t dummy_sig;
+    memset(&dummy_sig, 0, sizeof(dummy_sig));
+    ret = diag_log_signal(&closed_logger, &dummy_sig);
+    TEST_ASSERT(ret == 0 || ret == -1, "Logging to disabled logger does not crash");
+}
+
 int main(void) {
+    srand(42);  /* TW-2 fix: deterministic random for reproducible tests */
+
     printf("==============================================\n");
     printf(" MQP WPI Campus Integration Tests\n");
     printf("==============================================\n");
@@ -415,6 +495,7 @@ int main(void) {
     test_lcmv_spatial();
     test_diagnostic_logger();
     test_wpi_config();
+    test_logger_error_handling();
 
     printf("\n==============================================\n");
     printf(" Results: %d/%d passed\n", tests_passed, tests_run);
