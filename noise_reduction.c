@@ -109,6 +109,8 @@ music_status_t noise_floor_estimate(
     }
 
     int percentile_idx = (int)(num_bins * estimator->config.noise_percentile / 100.0);
+    if (percentile_idx >= num_bins) percentile_idx = num_bins - 1;
+    if (percentile_idx < 0) percentile_idx = 0;
     double percentile_value = sorted[percentile_idx];
 
     // Fill noise floor with minimum of spectrum and percentile
@@ -128,6 +130,8 @@ music_status_t noise_floor_update(
     if (!estimator || !spectrum) {
         return MUSIC_ERROR_NULL_POINTER;
     }
+
+    if (num_bins > estimator->num_bins) num_bins = estimator->num_bins;
 
     double* current_estimate = (double*)malloc(num_bins * sizeof(double));
     if (!current_estimate) {
@@ -666,7 +670,21 @@ music_status_t spatial_compute_null_weights(
     }
 
     int M = canceller->num_elements;
+
+    /* BUG-12 fix: derive radius from actual antenna positions if available */
     double radius = NR_UCA_RADIUS;
+    if (canceller->antenna_positions && M > 0) {
+        double r_sum = 0.0;
+        for (int i = 0; i < M; i++) {
+            double x = canceller->antenna_positions[i * 3 + 0];
+            double y = canceller->antenna_positions[i * 3 + 1];
+            r_sum += sqrt(x * x + y * y);
+        }
+        double r_avg = r_sum / M;
+        if (r_avg > 1e-10) {
+            radius = r_avg;
+        }
+    }
 
     /* Determine number of constraints */
     int num_constraints;
@@ -689,6 +707,9 @@ music_status_t spatial_compute_null_weights(
 
     if (num_constraints > M) {
         /* Over-determined: too many constraints for array size */
+        fprintf(stderr, "[noise_reduction] WARNING: %d constraints exceed %d elements, "
+                "reducing to %d (some interferers dropped)\n",
+                num_constraints, M, M - 1);
         num_constraints = M - 1;
     }
     if (num_constraints < 1) {
