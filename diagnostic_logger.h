@@ -33,11 +33,7 @@
 /** Maximum log message length */
 #define DIAG_MAX_MSG 512
 
-/** Maximum number of pipeline stages to track */
-#define DIAG_MAX_STAGES 16
-
-/** Ring buffer size for in-memory log (last N entries) */
-#define DIAG_RING_SIZE 256
+/* DIAG_MAX_STAGES and DIAG_RING_SIZE removed (DL-4: unused) */
 
 /* ============================================================================
  * Log Levels
